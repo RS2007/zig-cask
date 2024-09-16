@@ -1,0 +1,4 @@
+*.class
+zig-cache/
+zig-out/
+*.db
