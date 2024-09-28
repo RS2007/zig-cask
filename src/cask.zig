@@ -34,6 +34,25 @@ const KeyEntry = struct {
     timestamp: i64,
     offset: usize,
     totalSize: usize,
+
+    pub fn getLog(self: *KeyEntry, handle: *BitcaskHandle) !Log {
+        try handle.file.seekTo(self.offset);
+        const reader = handle.file.reader();
+        const timestamp = try reader.readInt(i64, std.builtin.Endian.little);
+        const keysz = try reader.readInt(usize, std.builtin.Endian.little);
+        const valuesz = try reader.readInt(usize, std.builtin.Endian.little);
+        const key = try handle.allocator.alloc(u8, keysz);
+        _ = try reader.readAtLeast(key, keysz);
+        const value = try handle.allocator.alloc(u8, valuesz);
+        _ = try reader.readAtLeast(value, valuesz);
+        return Log{
+            .tstamp = timestamp,
+            .keysz = keysz,
+            .valuesz = valuesz,
+            .key = key,
+            .value = value,
+        };
+    }
     pub fn getValue(self: *KeyEntry, handle: *BitcaskHandle) ![]u8 {
         try handle.file.seekTo(self.offset + @sizeOf(i64));
         const keysz = try handle.file.reader().readInt(usize, std.builtin.Endian.little);
@@ -47,6 +66,7 @@ const KeyEntry = struct {
 
 const BitcaskHandle = struct {
     file: std.fs.File,
+    fileName: []const u8,
     inMemMap: std.StringHashMap(KeyEntry),
     allocator: std.mem.Allocator,
     offset: usize = 0,
@@ -61,6 +81,7 @@ const BitcaskHandle = struct {
             .file = file,
             .inMemMap = inMemMap,
             .allocator = allocator,
+            .fileName = path,
         };
         return caskHandle;
     }
@@ -92,7 +113,6 @@ const BitcaskHandle = struct {
                     unreachable;
                 }
             };
-            std.log.warn("keysz: {d}, valuesz: {d}\n", .{ keysz, valuesz });
             const key = try allocator.alloc(u8, keysz);
             _ = try reader.readAtLeast(key, keysz);
             _ = try reader.skipBytes(valuesz, .{});
@@ -108,6 +128,7 @@ const BitcaskHandle = struct {
             .file = file,
             .inMemMap = inMemMap,
             .allocator = allocator,
+            .fileName = path,
         };
         return caskHandle;
     }
@@ -139,7 +160,40 @@ const BitcaskHandle = struct {
     }
     pub fn delete() void {}
     pub fn listKeys() void {}
-    pub fn merge() void {}
+    pub fn merge(self: *Self) !void {
+        // this might be a very naive way of implementing merge, but we basically flush the current hashmap after deleting its old contents
+        // TODO: incredible CPU usage is expected cause of the lousy implementation, should ideally
+        // have a reduced memory footprint(in place merge maybe?)
+
+        try self.file.seekTo(0);
+        var newInMemMap = std.StringHashMap(KeyEntry).init(self.allocator);
+        var hashMapIter = self.inMemMap.iterator();
+        var newBufferArrList = try std.ArrayList(u8).initCapacity(self.allocator, (try self.file.stat()).size);
+        var newBufOffset: usize = 0;
+        const newBufWriter = newBufferArrList.writer();
+        while (hashMapIter.next()) |entry| {
+            const val = try entry.value_ptr.getLog(self);
+            const serialized = try val.writeSerialized(self.allocator);
+            try newBufWriter.writeAll(serialized);
+            const keyEntry = try self.allocator.create(KeyEntry);
+            keyEntry.* = KeyEntry{
+                .timestamp = val.tstamp,
+                .offset = newBufOffset,
+                .totalSize = serialized.len,
+            };
+            try newInMemMap.put(
+                entry.key_ptr.*,
+                keyEntry.*,
+            );
+            newBufOffset += serialized.len;
+        }
+        self.file.close();
+        const newFile = try std.fs.cwd().openFile(self.fileName, .{ .mode = .read_write });
+        try newFile.writeAll(newBufferArrList.items);
+        self.inMemMap.deinit();
+        self.inMemMap = newInMemMap;
+        self.file = newFile;
+    }
     pub fn sync() void {}
     pub fn close(self: *Self) !void {
         self.file.close();
@@ -171,8 +225,7 @@ test "bitcask" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const handle = BitcaskHandle.open("tst.db", .RW, allocator);
-    std.log.warn("{any}\n", .{handle});
+    _ = try BitcaskHandle.open("tst.db", .RW, allocator);
     // check if the tst.db file is created in root directory
     const list = try walkDirectory(allocator, ".");
     std.debug.assert(list.contains("tst.db"));
@@ -208,12 +261,14 @@ test "open existing" {
         "key2",
         "key3",
         "key4",
+        "key1",
     };
     const values = [_][]const u8{
         "value1",
         "value2",
         "value3",
         "value4",
+        "value5",
     };
     for (keys, values) |key, value| {
         try handle.put(key, value);
@@ -222,6 +277,47 @@ test "open existing" {
     const openHandle = try BitcaskHandle.openExisting("tst.db", allocator);
     for (keys) |key| {
         std.log.warn("read value after open existing: {s}\n", .{(try openHandle.get(key))});
+    }
+    try openHandle.close();
+}
+
+test "merge" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const handle = try BitcaskHandle.open("tst.db", .RW, allocator);
+    const keys = [_][]const u8{
+        "key1",
+        "key2",
+        "key3",
+        "key4",
+        "key1",
+    };
+    const values = [_][]const u8{
+        "value1",
+        "value2",
+        "value3",
+        "value4",
+        "value5",
+    };
+    for (keys, values) |key, value| {
+        try handle.put(key, value);
+    }
+    try handle.close();
+    const openHandle = try BitcaskHandle.openExisting("tst.db", allocator);
+    for (keys) |key| {
+        std.log.warn("read value after open existing: {s}\n", .{(try openHandle.get(key))});
+    }
+    std.log.warn("size of file before merge: {} and hashmap: \n", .{(try openHandle.file.stat()).size});
+    var hashMapIter = openHandle.inMemMap.iterator();
+    while (hashMapIter.next()) |entry| {
+        std.log.warn("{s} and {s}\n", .{ entry.key_ptr.*, (try entry.value_ptr.getValue(openHandle)) });
+    }
+    try openHandle.merge();
+    hashMapIter = openHandle.inMemMap.iterator();
+    std.log.warn("merged and new size = {} and hashmap: \n", .{(try openHandle.file.stat()).size});
+    while (hashMapIter.next()) |entry| {
+        std.log.warn("{s} and {s}\n", .{ entry.key_ptr.*, (try entry.value_ptr.getValue(openHandle)) });
     }
     try openHandle.close();
 }
